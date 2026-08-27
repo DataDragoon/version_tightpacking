@@ -11,12 +11,33 @@ eliminates random PLL phase offsets between TX and RX synthesizers.
 import threading
 import time
 import numpy as np
+from datetime import datetime
 
 from bladerf_driver import BladeRFDriver
 from bladerf._bladerf import ffi, libbladeRF
 import bladerf
 
 SPEED_OF_LIGHT = 299_792_458
+
+
+def _log_timing(event, **details):
+    timestamp = datetime.now().strftime('%H:%M:%S.%f')
+    detail_str = ' '.join(f'{k}={v}' for k, v in details.items()) if details else ''
+    print(f"[{timestamp}] SFCW | {event:<30} {detail_str}", flush=True)
+
+
+def _log_separator(char='─'):
+    timestamp = datetime.now().strftime('%H:%M:%S.%f')
+    print(f"[{timestamp}] SFCW | {char * 70}", flush=True)
+
+
+def _format_duration(seconds):
+    if seconds < 0.001:
+        return f"{seconds*1000000:.0f}µs"
+    elif seconds < 1:
+        return f"{seconds*1000:.1f}ms"
+    else:
+        return f"{seconds:.3f}s"
 
 # Master quick-tune table: covers the whole usable band at a fixed grid, generated
 # once per device connection. Any sweep's start/stop/step is snapped onto this grid
@@ -504,6 +525,16 @@ class SFCWEngine:
         freqs, qt_rx, qt_tx = self._build_sweep_grid(start, stop, step)
         num_steps = len(freqs)
 
+        _log_separator('═')
+        _log_timing("SWEEP START",
+                   start=f"{start/1e9:.3f}GHz",
+                   stop=f"{stop/1e9:.3f}GHz",
+                   step=f"{step/1e6:.0f}MHz",
+                   num_steps=num_steps,
+                   num_buffers=num_buffers,
+                   settle_count=settle_count)
+        sweep_start = time.time()
+
         def progress(i):
             if self._callback and i % 10 == 0:
                 self._callback({
@@ -517,10 +548,26 @@ class SFCWEngine:
         if h_cal is None:
             return None
 
+        capture_duration = time.time() - sweep_start
+        _log_timing("CAPTURE COMPLETE",
+                   duration=_format_duration(capture_duration),
+                   valid_steps=f"{num_steps - dropped_steps}/{num_steps}")
+
         if dropped_steps > 0:
             print(f"[sfcw] WARNING: {dropped_steps}/{num_steps} steps had incomplete captures")
 
-        return self._process_h_cal(h_cal)
+        postproc_start = time.time()
+        result = self._process_h_cal(h_cal)
+        postproc_duration = time.time() - postproc_start
+
+        total_duration = time.time() - sweep_start
+        _log_timing("SWEEP END",
+                   total=_format_duration(total_duration),
+                   capture=_format_duration(capture_duration),
+                   postproc=_format_duration(postproc_duration))
+        _log_separator('═')
+
+        return result
 
     def _perform_sweep_raw(self):
         """Like _perform_sweep but returns raw h_cal array for averaging."""
@@ -565,20 +612,33 @@ class SFCWEngine:
             if stop_event.is_set():
                 return None, 0
 
+            step_start = time.time()
             f = int(freqs[i])
+
+            # --- Retune command ---
+            t_retune_start = time.time()
             if use_qt:
                 libbladeRF.bladerf_schedule_retune(dev_ptr, rx_ch, 0, f, qt_rx[i])
                 libbladeRF.bladerf_schedule_retune(dev_ptr, tx_ch, 0, f, qt_tx[i])
             else:
                 libbladeRF.bladerf_set_frequency(dev_ptr, tx_ch, f)
                 libbladeRF.bladerf_set_frequency(dev_ptr, rx_ch, f)
+            t_retune_end = time.time()
+            retune_duration = t_retune_end - t_retune_start
 
+            # --- Settle (wait for settle_count buffers) ---
+            t_settle_start = time.time()
             with rx_cond:
                 target_seq = self._rx_seq + settle_count
                 while self._rx_seq < target_seq:
                     if not rx_cond.wait(timeout=1.0):
                         break
+            t_settle_end = time.time()
+            settle_duration = t_settle_end - t_settle_start
 
+            # --- Capture num_buffers ---
+            t_capture_start = time.time()
+            with rx_cond:
                 sig_bufs = []
                 ref_bufs = []
                 last_seq = self._rx_seq
@@ -591,7 +651,11 @@ class SFCWEngine:
                     last_seq = self._rx_seq
                     sig_bufs.append(self._rx_latest[0])
                     ref_bufs.append(self._rx_latest[1])
+            t_capture_end = time.time()
+            capture_duration = t_capture_end - t_capture_start
 
+            # --- Compute ---
+            t_compute_start = time.time()
             if sig_bufs:
                 sig_arr = np.asarray(sig_bufs, dtype=np.float64)
                 ref_arr = np.asarray(ref_bufs, dtype=np.float64)
@@ -601,14 +665,32 @@ class SFCWEngine:
                 h_reference[i] = ref_cplx.mean()
             else:
                 dropped_steps += 1
+            t_compute_end = time.time()
+            compute_duration = t_compute_end - t_compute_start
+
+            step_end = time.time()
+            step_total = step_end - step_start
+
+            # Per-step timing summary
+            _log_timing(f"  Step {i:3d} {f/1e9:.3f}GHz",
+                       retune=_format_duration(retune_duration),
+                       settle=_format_duration(settle_duration),
+                       capture=_format_duration(capture_duration),
+                       compute=_format_duration(compute_duration),
+                       total=_format_duration(step_total))
 
             if progress_cb and i % 10 == 0:
                 progress_cb(i)
 
+        # --- Reference division ---
+        _log_separator('─')
+        _log_timing("REF DIVISION START")
+        t_ref = time.time()
         ref_mag = np.abs(h_reference)
         valid = ref_mag > 1e-10
         h_cal = np.zeros(num_steps, dtype=np.complex128)
         h_cal[valid] = h_signal[valid] / h_reference[valid]
+        _log_timing("REF DIVISION DONE", time=_format_duration(time.time() - t_ref))
 
         return h_cal, dropped_steps
 
