@@ -267,7 +267,7 @@ class BladeRFDriver:
         self.tx_running = True
         self.device.sync_config(
             layout=ChannelLayout.TX_X1,
-            fmt=Format.SC16_Q11,
+            fmt=Format.SC16_Q11_PACKED,
             num_buffers=16,
             buffer_size=4096,
             num_transfers=8,
@@ -308,7 +308,7 @@ class BladeRFDriver:
         self.rx_running = True
         self.device.sync_config(
             layout=ChannelLayout.RX_X1,
-            fmt=Format.SC16_Q11,
+            fmt=Format.SC16_Q11_PACKED,
             num_buffers=16,
             buffer_size=4096,
             num_transfers=8,
@@ -356,7 +356,7 @@ class BladeRFDriver:
         self._rebuild_tx_dual_buffer()
         self.device.sync_config(
             layout=ChannelLayout.TX_X2,
-            fmt=Format.SC16_Q11,
+            fmt=Format.SC16_Q11_PACKED,
             num_buffers=16,
             buffer_size=4096,
             num_transfers=8,
@@ -405,7 +405,7 @@ class BladeRFDriver:
         self._dual_channel = True
         self.device.sync_config(
             layout=ChannelLayout.RX_X2,
-            fmt=Format.SC16_Q11,
+            fmt=Format.SC16_Q11_PACKED,
             num_buffers=16,
             buffer_size=4096,
             num_transfers=8,
